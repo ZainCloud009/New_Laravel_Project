@@ -142,6 +142,16 @@ jobs:
               [ -n "$DB_PASSWORD" ] && (grep -q "^DB_PASSWORD=" .env && sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=$DB_PASSWORD|" .env || echo "DB_PASSWORD=$DB_PASSWORD" >> .env)
             fi
 
+            # Setup AWS RDS CA Certificate for secure SSL/TLS connection
+            mkdir -p "$TARGET_DIR/storage/certs"
+            if [ ! -f "$TARGET_DIR/storage/certs/rds-ca-bundle.pem" ]; then
+              echo "🔒 Downloading AWS RDS CA Certificate Bundle..."
+              curl -sS https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem -o "$TARGET_DIR/storage/certs/rds-ca-bundle.pem"
+            fi
+
+            grep -q "^MYSQL_ATTR_SSL_CA=" .env && sed -i "s|^MYSQL_ATTR_SSL_CA=.*|MYSQL_ATTR_SSL_CA=$TARGET_DIR/storage/certs/rds-ca-bundle.pem|" .env || echo "MYSQL_ATTR_SSL_CA=$TARGET_DIR/storage/certs/rds-ca-bundle.pem" >> .env
+            grep -q "^MYSQL_ATTR_SSL_VERIFY_SERVER_CERT=" .env && sed -i "s|^MYSQL_ATTR_SSL_VERIFY_SERVER_CERT=.*|MYSQL_ATTR_SSL_VERIFY_SERVER_CERT=false|" .env || echo "MYSQL_ATTR_SSL_VERIFY_SERVER_CERT=false" >> .env
+
             # Install/Update Composer Dependencies (Production)
             echo "📦 Installing Composer dependencies..."
             composer install --no-dev --prefer-dist --optimize-autoloader --no-interaction
