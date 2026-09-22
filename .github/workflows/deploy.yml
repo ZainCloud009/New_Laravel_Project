@@ -56,6 +56,12 @@ jobs:
       - name: Execute Tests
         run: php artisan test
 
+      - name: Upload Compiled Assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiled-assets
+          path: public/build
+
   deploy:
     name: Deploy to AWS EC2
     needs: tests
@@ -63,6 +69,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Download Compiled Assets
+        uses: actions/download-artifact@v4
+        with:
+          name: compiled-assets
+          path: public/build
+
       - name: Deploy to EC2 via SSH
         env:
           EC2_HOST: ${{ secrets.EC2_HOST }}
@@ -81,7 +93,7 @@ jobs:
           # 2. Add Host to known_hosts
           ssh-keyscan -p "$EC2_PORT" -H "$EC2_HOST" >> ~/.ssh/known_hosts 2>/dev/null
 
-          # 3. Execute Deployment Script on EC2
+          # 3. Pull/Clone Repository & Composer Install on EC2
           ssh -i ~/.ssh/deploy_key -p "$EC2_PORT" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 "$EC2_USER@$EC2_HOST" "GITHUB_TOKEN='$GITHUB_TOKEN' REPOSITORY='$REPOSITORY' bash -se" << 'EOF'
             set -ex
 
@@ -90,7 +102,7 @@ jobs:
 
             echo "🚀 Starting deployment to $TARGET_DIR..."
 
-            # 1. Directory and Repository Clone/Pull
+            # Directory and Repository Clone/Pull
             if [ ! -d "$TARGET_DIR/.git" ]; then
               echo "📂 Target directory does not contain git repository. Cloning repository..."
               sudo mkdir -p "$TARGET_DIR" 2>/dev/null || mkdir -p "$TARGET_DIR"
@@ -108,7 +120,7 @@ jobs:
             # Clean remote URL so token is not retained in git config
             git remote set-url origin "https://github.com/${REPOSITORY}.git"
 
-            # 2. Check and configure .env
+            # Check and configure .env
             if [ ! -f .env ]; then
               echo "⚙️ .env file not found. Creating from .env.example..."
               cp .env.example .env
@@ -116,31 +128,34 @@ jobs:
               touch database/database.sqlite
             fi
 
-            # 3. Install/Update Composer Dependencies (Production)
+            # Install/Update Composer Dependencies (Production)
             echo "📦 Installing Composer dependencies..."
             composer install --no-dev --prefer-dist --optimize-autoloader --no-interaction
+          EOF
 
-            # 4. Install NPM Dependencies & Build Assets
-            echo "🎨 Building frontend assets..."
-            if command -v npm &> /dev/null; then
-              npm ci --prefer-offline --no-audit || npm install --no-audit
-              npm run build
-            else
-              echo "⚠️ npm is not installed or not in system PATH."
-            fi
+          # 4. Transfer Compiled Frontend Assets (Built in GitHub Actions with Node 22)
+          echo "🎨 Syncing compiled Vite assets to EC2..."
+          tar -czf - -C public build | ssh -i ~/.ssh/deploy_key -p "$EC2_PORT" -o StrictHostKeyChecking=accept-new "$EC2_USER@$EC2_HOST" "mkdir -p /var/www/html/New_Laravel_Project/public && tar -xzf - -C /var/www/html/New_Laravel_Project/public"
 
-            # 5. Run Database Migrations
+          # 5. Run Migrations, Cache & Reload Web Services on EC2
+          ssh -i ~/.ssh/deploy_key -p "$EC2_PORT" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 "$EC2_USER@$EC2_HOST" "bash -se" << 'EOF'
+            set -ex
+
+            TARGET_DIR="/var/www/html/New_Laravel_Project"
+            cd "$TARGET_DIR"
+
+            # Run Database Migrations
             echo "🗄️ Running database migrations..."
             php artisan migrate --force
 
-            # 6. Optimize Laravel Cache
+            # Optimize Laravel Cache
             echo "⚡ Optimizing application caches..."
             php artisan config:cache
             php artisan route:cache
             php artisan view:cache
             php artisan event:cache
 
-            # 7. Set Directory Permissions
+            # Set Directory Permissions
             echo "🔒 Setting directory permissions..."
             WEB_USER="www-data"
             if ! id -u www-data >/dev/null 2>&1; then
@@ -154,9 +169,9 @@ jobs:
             fi
 
             sudo chown -R $USER:$WEB_USER "$TARGET_DIR" 2>/dev/null || chown -R $USER "$TARGET_DIR" 2>/dev/null || true
-            sudo chmod -R 775 "$TARGET_DIR/storage" "$TARGET_DIR/bootstrap/cache" 2>/dev/null || chmod -R 775 "$TARGET_DIR/storage" "$TARGET_DIR/bootstrap/cache" 2>/dev/null || true
+            sudo chmod -R 775 "$TARGET_DIR/storage" "$TARGET_DIR/bootstrap/cache" "$TARGET_DIR/public/build" 2>/dev/null || chmod -R 775 "$TARGET_DIR/storage" "$TARGET_DIR/bootstrap/cache" "$TARGET_DIR/public/build" 2>/dev/null || true
 
-            # 8. Reload Web Services
+            # Reload Web Services
             echo "🔄 Reloading services..."
             if sudo systemctl is-active --quiet php8.2-fpm 2>/dev/null; then
               sudo systemctl reload php8.2-fpm 2>/dev/null || true
