@@ -83,6 +83,10 @@ jobs:
           EC2_PORT: ${{ secrets.EC2_PORT || '22' }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPOSITORY: ${{ github.repository }}
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_DATABASE: ${{ secrets.DB_DATABASE }}
+          DB_USERNAME: ${{ secrets.DB_USERNAME }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
         run: |
           # 1. Setup SSH Key
           mkdir -p ~/.ssh
@@ -94,7 +98,7 @@ jobs:
           ssh-keyscan -p "$EC2_PORT" -H "$EC2_HOST" >> ~/.ssh/known_hosts 2>/dev/null
 
           # 3. Pull/Clone Repository & Composer Install on EC2
-          ssh -i ~/.ssh/deploy_key -p "$EC2_PORT" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 "$EC2_USER@$EC2_HOST" "GITHUB_TOKEN='$GITHUB_TOKEN' REPOSITORY='$REPOSITORY' bash -se" << 'EOF'
+          ssh -i ~/.ssh/deploy_key -p "$EC2_PORT" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 "$EC2_USER@$EC2_HOST" "GITHUB_TOKEN='$GITHUB_TOKEN' REPOSITORY='$REPOSITORY' DB_HOST='$DB_HOST' DB_DATABASE='$DB_DATABASE' DB_USERNAME='$DB_USERNAME' DB_PASSWORD='$DB_PASSWORD' bash -se" << 'EOF'
             set -ex
 
             TARGET_DIR="/var/www/html/New_Laravel_Project"
@@ -125,7 +129,17 @@ jobs:
               echo "⚙️ .env file not found. Creating from .env.example..."
               cp .env.example .env
               php artisan key:generate --force
-              touch database/database.sqlite
+            fi
+
+            # Update RDS database credentials if provided via GitHub Secrets
+            if [ -n "$DB_HOST" ]; then
+              echo "⚙️ Updating Database credentials from GitHub Secrets..."
+              grep -q "^DB_CONNECTION=" .env && sed -i "s|^DB_CONNECTION=.*|DB_CONNECTION=mysql|" .env || echo "DB_CONNECTION=mysql" >> .env
+              grep -q "^DB_HOST=" .env && sed -i "s|^DB_HOST=.*|DB_HOST=$DB_HOST|" .env || echo "DB_HOST=$DB_HOST" >> .env
+              grep -q "^DB_PORT=" .env && sed -i "s|^DB_PORT=.*|DB_PORT=3306|" .env || echo "DB_PORT=3306" >> .env
+              [ -n "$DB_DATABASE" ] && (grep -q "^DB_DATABASE=" .env && sed -i "s|^DB_DATABASE=.*|DB_DATABASE=$DB_DATABASE|" .env || echo "DB_DATABASE=$DB_DATABASE" >> .env)
+              [ -n "$DB_USERNAME" ] && (grep -q "^DB_USERNAME=" .env && sed -i "s|^DB_USERNAME=.*|DB_USERNAME=$DB_USERNAME|" .env || echo "DB_USERNAME=$DB_USERNAME" >> .env)
+              [ -n "$DB_PASSWORD" ] && (grep -q "^DB_PASSWORD=" .env && sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=$DB_PASSWORD|" .env || echo "DB_PASSWORD=$DB_PASSWORD" >> .env)
             fi
 
             # Install/Update Composer Dependencies (Production)
@@ -143,6 +157,11 @@ jobs:
 
             TARGET_DIR="/var/www/html/New_Laravel_Project"
             cd "$TARGET_DIR"
+
+            # Clear cached config so fresh .env is loaded
+            php artisan config:clear
+            php artisan route:clear
+            php artisan view:clear
 
             # Run Database Migrations
             echo "🗄️ Running database migrations..."
