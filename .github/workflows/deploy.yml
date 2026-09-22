@@ -1,0 +1,162 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  tests:
+    name: Run Automated Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          extensions: mbstring, xml, ctype, iconv, intl, pdo, pdo_sqlite, sqlite3, bcmath, curl, zip
+          coverage: none
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Copy Environment Configuration
+        run: cp .env.example .env
+
+      - name: Cache Composer Dependencies
+        uses: actions/cache@v4
+        with:
+          path: vendor
+          key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-composer-
+
+      - name: Install Composer Dependencies
+        run: composer install -q --no-ansi --no-interaction --no-scripts --no-progress --prefer-dist
+
+      - name: Generate Application Key
+        run: php artisan key:generate
+
+      - name: Install NPM Dependencies & Build Assets
+        run: |
+          npm ci || npm install
+          npm run build
+
+      - name: Execute Tests
+        run: php artisan test
+
+  deploy:
+    name: Deploy to AWS EC2
+    needs: tests
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy application to EC2 via SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: ${{ secrets.EC2_PORT || '22' }}
+          script_stop: true
+          script: |
+            set -e
+
+            TARGET_DIR="/var/www/html/New_Laravel_Project"
+            REPO_URL="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+
+            echo "🚀 Starting deployment to $TARGET_DIR..."
+
+            # 1. Directory and Repository Clone/Pull
+            if [ ! -d "$TARGET_DIR/.git" ]; then
+              echo "📂 Target directory does not contain git repository. Cloning repository..."
+              sudo mkdir -p "$TARGET_DIR"
+              sudo chown -R $USER:$USER "$TARGET_DIR"
+              git clone "$REPO_URL" "$TARGET_DIR"
+              cd "$TARGET_DIR"
+            else
+              echo "🔄 Repository exists. Pulling latest code..."
+              cd "$TARGET_DIR"
+              git remote set-url origin "$REPO_URL"
+              git fetch origin main
+              git reset --hard origin/main
+            fi
+
+            # Clean remote URL so token is not retained in config
+            git remote set-url origin "https://github.com/${{ github.repository }}.git"
+
+            # 2. Check and configure .env
+            if [ ! -f .env ]; then
+              echo "⚙️ .env file not found. Creating from .env.example..."
+              cp .env.example .env
+              php artisan key:generate --force
+              touch database/database.sqlite
+            fi
+
+            # 3. Install/Update Composer Dependencies (Production)
+            echo "📦 Installing Composer dependencies..."
+            composer install --no-dev --prefer-dist --optimize-autoloader --no-interaction
+
+            # 4. Install NPM Dependencies & Build Assets
+            echo "🎨 Building frontend assets..."
+            if command -v npm &> /dev/null; then
+              npm ci --prefer-offline --no-audit || npm install --no-audit
+              npm run build
+            else
+              echo "⚠️ npm is not installed or not in system PATH."
+            fi
+
+            # 5. Run Database Migrations
+            echo "🗄️ Running database migrations..."
+            php artisan migrate --force
+
+            # 6. Optimize Laravel Cache
+            echo "⚡ Optimizing application caches..."
+            php artisan config:cache
+            php artisan route:cache
+            php artisan view:cache
+            php artisan event:cache
+
+            # 7. Set Directory Permissions
+            echo "🔒 Setting directory permissions..."
+            WEB_USER="www-data"
+            if ! id -u www-data >/dev/null 2>&1; then
+              if id -u nginx >/dev/null 2>&1; then
+                WEB_USER="nginx"
+              elif id -u apache >/dev/null 2>&1; then
+                WEB_USER="apache"
+              else
+                WEB_USER="$USER"
+              fi
+            fi
+
+            sudo chown -R $USER:$WEB_USER "$TARGET_DIR" 2>/dev/null || chown -R $USER "$TARGET_DIR" 2>/dev/null || true
+            sudo chmod -R 775 "$TARGET_DIR/storage" "$TARGET_DIR/bootstrap/cache" 2>/dev/null || chmod -R 775 "$TARGET_DIR/storage" "$TARGET_DIR/bootstrap/cache" 2>/dev/null || true
+
+            # 8. Reload Web Services
+            echo "🔄 Reloading services..."
+            if sudo systemctl is-active --quiet php8.2-fpm; then
+              sudo systemctl reload php8.2-fpm
+            elif sudo systemctl is-active --quiet php-fpm; then
+              sudo systemctl reload php-fpm
+            fi
+
+            if sudo systemctl is-active --quiet nginx; then
+              sudo systemctl reload nginx
+            elif sudo systemctl is-active --quiet apache2; then
+              sudo systemctl reload apache2
+            elif sudo systemctl is-active --quiet httpd; then
+              sudo systemctl reload httpd
+            fi
+
+            echo "✅ Deployment completed successfully!"
