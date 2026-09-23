@@ -165,16 +165,32 @@ jobs:
 
             echo "🐳 Starting Docker deployment on EC2 for $IMAGE_NAME..."
 
-            # 1. Free Port 80 by disabling host web server if active
-            if sudo systemctl is-active --quiet nginx 2>/dev/null; then
-              echo "🛑 Stopping host Nginx to free Port 80 for Docker..."
-              sudo systemctl stop nginx || true
-              sudo systemctl disable nginx || true
+            # 1. Thoroughly free Port 80 from host web servers and orphan processes
+            echo "🛑 Ensuring Port 80 is completely free for Docker..."
+            sudo systemctl stop nginx 2>/dev/null || true
+            sudo systemctl disable nginx 2>/dev/null || true
+            sudo systemctl stop apache2 2>/dev/null || true
+            sudo systemctl disable apache2 2>/dev/null || true
+            sudo systemctl stop httpd 2>/dev/null || true
+
+            # Kill any orphaned host process currently listening on Port 80
+            if command -v fuser &>/dev/null; then
+              sudo fuser -k 80/tcp 2>/dev/null || true
+            elif command -v lsof &>/dev/null; then
+              sudo kill -9 $(sudo lsof -t -i:80) 2>/dev/null || true
             fi
-            if sudo systemctl is-active --quiet apache2 2>/dev/null; then
-              sudo systemctl stop apache2 || true
-              sudo systemctl disable apache2 || true
+
+            # Stop and remove any other Docker container occupying Port 80
+            CONTAINERS_ON_80=$(sudo docker ps -q --filter "publish=80")
+            if [ -n "$CONTAINERS_ON_80" ]; then
+              echo "🛑 Stopping conflicting Docker container(s) on Port 80: $CONTAINERS_ON_80..."
+              sudo docker stop $CONTAINERS_ON_80 2>/dev/null || true
+              sudo docker rm -f $CONTAINERS_ON_80 2>/dev/null || true
             fi
+
+            # Force remove existing laravel_app container (in running, stopped, or created state)
+            sudo docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+            sleep 1
 
             # 2. Authenticate Docker with Amazon ECR
             echo "🔑 Logging in to Amazon ECR: $ECR_REGISTRY..."
@@ -192,14 +208,7 @@ jobs:
               echo "⚠️ Notice: $ENV_FILE not found, skipping migration step."
             fi
 
-            # 5. Stop and remove existing container
-            if sudo docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-              echo "🛑 Replacing existing container..."
-              sudo docker stop "$CONTAINER_NAME" || true
-              sudo docker rm "$CONTAINER_NAME" || true
-            fi
-
-            # 6. Ensure log directory exists on host for persistent logs
+            # 5. Ensure log directory exists on host for persistent logs
             sudo mkdir -p /var/www/html/New_Laravel_Project/storage/logs 2>/dev/null || true
             sudo chmod -R 777 /var/www/html/New_Laravel_Project/storage/logs 2>/dev/null || true
 
