@@ -1,0 +1,51 @@
+{
+  "family": "laravel-app-ec2-task",
+  "networkMode": "bridge",
+  "requiresCompatibilities": [
+    "EC2"
+  ],
+  "executionRoleArn": "arn:aws:iam::634236768016:role/ecsTaskExecutionRole",
+  "containerDefinitions": [
+    {
+      "name": "laravel_app",
+      "image": "634236768016.dkr.ecr.eu-north-1.amazonaws.com/laravelprojimage:latest",
+      "essential": true,
+      "cpu": 256,
+      "memoryReservation": 512,
+      "portMappings": [
+        {
+          "containerPort": 80,
+          "hostPort": 80,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        { "name": "APP_NAME", "value": "Laravel" },
+        { "name": "APP_ENV", "value": "production" },
+        { "name": "APP_DEBUG", "value": "false" },
+        { "name": "APP_KEY", "value": "base64:79diLxbM3/y28VpmB5guR0XKk8FSz8BMGXgWg3qu8ko=" },
+        { "name": "APP_URL", "value": "https://iamzain.space" },
+        { "name": "DB_CONNECTION", "value": "mysql" },
+        { "name": "DB_HOST", "value": "laravel-project-db.cl2qmoywm03g.eu-north-1.rds.amazonaws.com" },
+        { "name": "DB_PORT", "value": "3306" },
+        { "name": "DB_DATABASE", "value": "idea" },
+        { "name": "DB_USERNAME", "value": "YOUR_RDS_USERNAME" },
+        { "name": "DB_PASSWORD", "value": "YOUR_RDS_PASSWORD" },
+        { "name": "MYSQL_ATTR_SSL_CA", "value": "/var/www/html/storage/certs/rds-ca-bundle.pem" },
+        { "name": "MYSQL_ATTR_SSL_VERIFY_SERVER_CERT", "value": "false" },
+        { "name": "SESSION_DRIVER", "value": "database" },
+        { "name": "CACHE_STORE", "value": "database" },
+        { "name": "QUEUE_CONNECTION", "value": "database" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/laravel-ec2-app",
+          "awslogs-region": "eu-north-1",
+          "awslogs-stream-prefix": "ecs",
+          "awslogs-create-group": "true"
+        }
+      }
+    }
+  ]
+}
