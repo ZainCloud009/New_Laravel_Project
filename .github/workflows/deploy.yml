@@ -63,16 +63,12 @@ jobs:
     runs-on: ubuntu-latest
 
     outputs:
-      registry: ${{ steps.login-ecr.outputs.registry }}
-      image_tag: ${{ steps.set-tag.outputs.image_tag }}
+      registry: ${{ steps.ecr-info.outputs.registry }}
+      image_tag: ${{ github.sha }}
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
-
-      - name: Set Image Tag
-        id: set-tag
-        run: echo "image_tag=${{ github.sha }}" >> $GITHUB_OUTPUT
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -80,6 +76,15 @@ jobs:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION || 'eu-north-1' }}
+
+      - name: Get ECR Registry URI
+        id: ecr-info
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          REGION="${{ secrets.AWS_REGION || 'eu-north-1' }}"
+          REGISTRY="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com"
+          echo "registry=${REGISTRY}" >> $GITHUB_OUTPUT
+          echo "Target ECR Registry: ${REGISTRY}"
 
       - name: Log in to Amazon ECR
         id: login-ecr
@@ -94,8 +99,8 @@ jobs:
           context: .
           push: true
           tags: |
-            ${{ steps.login-ecr.outputs.registry }}/laravelprojimage:${{ steps.set-tag.outputs.image_tag }}
-            ${{ steps.login-ecr.outputs.registry }}/laravelprojimage:latest
+            ${{ steps.ecr-info.outputs.registry }}/laravelprojimage:${{ github.sha }}
+            ${{ steps.ecr-info.outputs.registry }}/laravelprojimage:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -113,12 +118,17 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION || 'eu-north-1' }}
 
-      - name: Generate ECR Login Token
-        id: ecr-token
+      - name: Get ECR Registry & Auth Token
+        id: ecr-auth
         run: |
-          TOKEN=$(aws ecr get-login-password --region ${{ secrets.AWS_REGION || 'eu-north-1' }})
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          REGION="${{ secrets.AWS_REGION || 'eu-north-1' }}"
+          REGISTRY="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com"
+          TOKEN=$(aws ecr get-login-password --region "$REGION")
           echo "::add-mask::$TOKEN"
-          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+          echo "registry=${REGISTRY}" >> $GITHUB_OUTPUT
+          echo "token=${TOKEN}" >> $GITHUB_OUTPUT
+          echo "Resolved ECR Registry: ${REGISTRY}"
 
       - name: Deploy Container to EC2 via SSH
         env:
@@ -126,9 +136,9 @@ jobs:
           EC2_USER: ${{ secrets.EC2_USER }}
           EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
           EC2_PORT: ${{ secrets.EC2_PORT || '22' }}
-          ECR_REGISTRY: ${{ needs.build-and-push.outputs.registry }}
-          IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
-          ECR_TOKEN: ${{ steps.ecr-token.outputs.token }}
+          ECR_REGISTRY: ${{ steps.ecr-auth.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+          ECR_TOKEN: ${{ steps.ecr-auth.outputs.token }}
         run: |
           # 1. Setup SSH Key
           mkdir -p ~/.ssh
@@ -144,11 +154,16 @@ jobs:
             "ECR_REGISTRY='$ECR_REGISTRY' IMAGE_TAG='$IMAGE_TAG' ECR_TOKEN='$ECR_TOKEN' bash -se" << 'EOF'
             set -ex
 
+            if [ -z "$ECR_REGISTRY" ]; then
+              echo "❌ Error: ECR_REGISTRY was not passed correctly."
+              exit 1
+            fi
+
             IMAGE_NAME="$ECR_REGISTRY/laravelprojimage:latest"
             CONTAINER_NAME="laravel_app"
             ENV_FILE="/var/www/html/New_Laravel_Project/.env"
 
-            echo "🐳 Starting Docker deployment on EC2..."
+            echo "🐳 Starting Docker deployment on EC2 for $IMAGE_NAME..."
 
             # 1. Free Port 80 by disabling host web server if active
             if sudo systemctl is-active --quiet nginx 2>/dev/null; then
@@ -162,7 +177,7 @@ jobs:
             fi
 
             # 2. Authenticate Docker with Amazon ECR
-            echo "🔑 Logging in to Amazon ECR..."
+            echo "🔑 Logging in to Amazon ECR: $ECR_REGISTRY..."
             echo "$ECR_TOKEN" | sudo docker login --username AWS --password-stdin "$ECR_REGISTRY"
 
             # 3. Pull latest image from ECR
