@@ -159,7 +159,7 @@ jobs:
               exit 1
             fi
 
-            IMAGE_NAME="$ECR_REGISTRY/laravelprojimage:latest"
+            IMAGE_NAME="$ECR_REGISTRY/laravelprojimage:${IMAGE_TAG}"
             CONTAINER_NAME="laravel_app"
             ENV_FILE="/var/www/html/New_Laravel_Project/.env"
 
