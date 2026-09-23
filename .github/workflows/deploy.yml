@@ -105,136 +105,65 @@ jobs:
           cache-to: type=gha,mode=max
 
   deploy:
-    name: Deploy Container to EC2
+    name: Deploy to Amazon ECS
     needs: build-and-push
     if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
 
     steps:
-      - name: Configure AWS Credentials for Deployment Token
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION || 'eu-north-1' }}
 
-      - name: Get ECR Registry & Auth Token
-        id: ecr-auth
-        run: |
-          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          REGION="${{ secrets.AWS_REGION || 'eu-north-1' }}"
-          REGISTRY="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com"
-          TOKEN=$(aws ecr get-login-password --region "$REGION")
-          echo "::add-mask::$TOKEN"
-          echo "registry=${REGISTRY}" >> $GITHUB_OUTPUT
-          echo "token=${TOKEN}" >> $GITHUB_OUTPUT
-          echo "Resolved ECR Registry: ${REGISTRY}"
-
-      - name: Deploy Container to EC2 via SSH
+      - name: Clean Legacy Standalone Container on Port 80 (One-Time Fallback)
         env:
           EC2_HOST: ${{ secrets.EC2_HOST }}
           EC2_USER: ${{ secrets.EC2_USER }}
           EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
           EC2_PORT: ${{ secrets.EC2_PORT || '22' }}
-          ECR_REGISTRY: ${{ steps.ecr-auth.outputs.registry }}
-          IMAGE_TAG: ${{ github.sha }}
-          ECR_TOKEN: ${{ steps.ecr-auth.outputs.token }}
         run: |
-          # 1. Setup SSH Key
-          mkdir -p ~/.ssh
-          echo "$EC2_SSH_KEY" | tr -d '\r' > ~/.ssh/deploy_key
-          echo "" >> ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
+          if [ -n "$EC2_SSH_KEY" ] && [ -n "$EC2_HOST" ]; then
+            echo "🧹 Ensuring Port 80 on EC2 is completely free for ECS..."
+            mkdir -p ~/.ssh
+            echo "$EC2_SSH_KEY" | tr -d '\r' > ~/.ssh/deploy_key
+            chmod 600 ~/.ssh/deploy_key
+            ssh-keyscan -p "$EC2_PORT" -H "$EC2_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+            ssh -i ~/.ssh/deploy_key -p "$EC2_PORT" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 "$EC2_USER@$EC2_HOST" \
+              "sudo docker rm -f \$(sudo docker ps -q --filter 'publish=80') 2>/dev/null || true; sudo docker rm -f laravel_app 2>/dev/null || true" || true
+            rm -f ~/.ssh/deploy_key
+          fi
 
-          # 2. Add Host to known_hosts
-          ssh-keyscan -p "$EC2_PORT" -H "$EC2_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+      - name: Fetch Current ECS Task Definition
+        id: fetch-task-def
+        run: |
+          REGION="${{ secrets.AWS_REGION || 'eu-north-1' }}"
+          echo "📥 Fetching latest active task definition from ECS..."
+          aws ecs describe-task-definition \
+            --task-definition laravel-app-ec2-task \
+            --region "$REGION" \
+            --query taskDefinition > task-def.json
 
-          # 3. Execute Docker deployment on EC2
-          ssh -i ~/.ssh/deploy_key -p "$EC2_PORT" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 "$EC2_USER@$EC2_HOST" \
-            "ECR_REGISTRY='$ECR_REGISTRY' IMAGE_TAG='$IMAGE_TAG' ECR_TOKEN='$ECR_TOKEN' bash -se" << 'EOF'
-            set -ex
+          # Strip metadata fields not accepted by ECS register-task-definition
+          jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' task-def.json > task-definition-clean.json
 
-            if [ -z "$ECR_REGISTRY" ]; then
-              echo "❌ Error: ECR_REGISTRY was not passed correctly."
-              exit 1
-            fi
+      - name: Render Amazon ECS Task Definition
+        id: render-app-container
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition-clean.json
+          container-name: laravel_app
+          image: ${{ needs.build-and-push.outputs.registry }}/laravelprojimage:${{ needs.build-and-push.outputs.image_tag }}
 
-            IMAGE_NAME="$ECR_REGISTRY/laravelprojimage:${IMAGE_TAG}"
-            CONTAINER_NAME="laravel_app"
-            ENV_FILE="/var/www/html/New_Laravel_Project/.env"
-
-            echo "🐳 Starting Docker deployment on EC2 for $IMAGE_NAME..."
-
-            # 1. Thoroughly free Port 80 from host web servers and orphan processes
-            echo "🛑 Ensuring Port 80 is completely free for Docker..."
-            sudo systemctl stop nginx 2>/dev/null || true
-            sudo systemctl disable nginx 2>/dev/null || true
-            sudo systemctl stop apache2 2>/dev/null || true
-            sudo systemctl disable apache2 2>/dev/null || true
-            sudo systemctl stop httpd 2>/dev/null || true
-
-            # Kill any orphaned host process currently listening on Port 80
-            if command -v fuser &>/dev/null; then
-              sudo fuser -k 80/tcp 2>/dev/null || true
-            elif command -v lsof &>/dev/null; then
-              sudo kill -9 $(sudo lsof -t -i:80) 2>/dev/null || true
-            fi
-
-            # Stop and remove any other Docker container occupying Port 80
-            CONTAINERS_ON_80=$(sudo docker ps -q --filter "publish=80")
-            if [ -n "$CONTAINERS_ON_80" ]; then
-              echo "🛑 Stopping conflicting Docker container(s) on Port 80: $CONTAINERS_ON_80..."
-              sudo docker stop $CONTAINERS_ON_80 2>/dev/null || true
-              sudo docker rm -f $CONTAINERS_ON_80 2>/dev/null || true
-            fi
-
-            # Force remove existing laravel_app container (in running, stopped, or created state)
-            sudo docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
-            sleep 1
-
-            # 2. Authenticate Docker with Amazon ECR
-            echo "🔑 Logging in to Amazon ECR: $ECR_REGISTRY..."
-            echo "$ECR_TOKEN" | sudo docker login --username AWS --password-stdin "$ECR_REGISTRY"
-
-            # 3. Pull latest image from ECR
-            echo "📥 Pulling latest image: $IMAGE_NAME..."
-            sudo docker pull "$IMAGE_NAME"
-
-            # 4. Run database migrations inside container
-            if [ -f "$ENV_FILE" ]; then
-              echo "🗄️ Running migrations inside Docker container..."
-              sudo docker run --rm --env-file "$ENV_FILE" "$IMAGE_NAME" php artisan migrate --force
-            else
-              echo "⚠️ Notice: $ENV_FILE not found, skipping migration step."
-            fi
-
-            # 5. Ensure log directory exists on host for persistent logs
-            sudo mkdir -p /var/www/html/New_Laravel_Project/storage/logs 2>/dev/null || true
-            sudo chmod -R 777 /var/www/html/New_Laravel_Project/storage/logs 2>/dev/null || true
-
-            # 7. Start the container
-            echo "🚀 Launching new container: $CONTAINER_NAME on Port 80..."
-            if [ -f "$ENV_FILE" ]; then
-              sudo docker run -d \
-                --name "$CONTAINER_NAME" \
-                --restart unless-stopped \
-                -p 80:80 \
-                --env-file "$ENV_FILE" \
-                -v /var/www/html/New_Laravel_Project/storage/logs:/var/www/html/storage/logs \
-                "$IMAGE_NAME"
-            else
-              sudo docker run -d \
-                --name "$CONTAINER_NAME" \
-                --restart unless-stopped \
-                -p 80:80 \
-                -v /var/www/html/New_Laravel_Project/storage/logs:/var/www/html/storage/logs \
-                "$IMAGE_NAME"
-            fi
-
-            # 8. Clean old dangling images
-            echo "🧹 Removing old unused Docker images..."
-            sudo docker image prune -f || true
-
-            echo "✅ Docker application is successfully running!"
-            sudo docker ps --filter "name=$CONTAINER_NAME"
-          EOF
+      - name: Deploy Amazon ECS Task Definition
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render-app-container.outputs.task-definition }}
+          service: laravel-ec2-service
+          cluster: laravel-ec2-cluster
+          wait-for-service-stability: true
