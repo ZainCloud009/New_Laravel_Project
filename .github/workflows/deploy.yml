@@ -1,4 +1,4 @@
-name: CI/CD Pipeline
+name: CI/CD Pipeline (Docker & AWS ECR)
 
 on:
   push:
@@ -56,37 +56,79 @@ jobs:
       - name: Execute Tests
         run: php artisan test
 
-      - name: Upload Compiled Assets
-        uses: actions/upload-artifact@v4
-        with:
-          name: compiled-assets
-          path: public/build
-
-  deploy:
-    name: Deploy to AWS EC2
+  build-and-push:
+    name: Build & Push Docker Image to ECR
     needs: tests
     if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
 
-    steps:
-      - name: Download Compiled Assets
-        uses: actions/download-artifact@v4
-        with:
-          name: compiled-assets
-          path: public/build
+    outputs:
+      registry: ${{ steps.login-ecr.outputs.registry }}
+      image_tag: ${{ steps.set-tag.outputs.image_tag }}
 
-      - name: Deploy to EC2 via SSH
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set Image Tag
+        id: set-tag
+        run: echo "image_tag=${{ github.sha }}" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION || 'eu-north-1' }}
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/laravelprojimage:${{ steps.set-tag.outputs.image_tag }}
+            ${{ steps.login-ecr.outputs.registry }}/laravelprojimage:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy Container to EC2
+    needs: build-and-push
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure AWS Credentials for Deployment Token
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION || 'eu-north-1' }}
+
+      - name: Generate ECR Login Token
+        id: ecr-token
+        run: |
+          TOKEN=$(aws ecr get-login-password --region ${{ secrets.AWS_REGION || 'eu-north-1' }})
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Deploy Container to EC2 via SSH
         env:
           EC2_HOST: ${{ secrets.EC2_HOST }}
           EC2_USER: ${{ secrets.EC2_USER }}
           EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
           EC2_PORT: ${{ secrets.EC2_PORT || '22' }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPOSITORY: ${{ github.repository }}
-          DB_HOST: ${{ secrets.DB_HOST }}
-          DB_DATABASE: ${{ secrets.DB_DATABASE }}
-          DB_USERNAME: ${{ secrets.DB_USERNAME }}
-          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          ECR_REGISTRY: ${{ needs.build-and-push.outputs.registry }}
+          IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+          ECR_TOKEN: ${{ steps.ecr-token.outputs.token }}
         run: |
           # 1. Setup SSH Key
           mkdir -p ~/.ssh
@@ -97,124 +139,78 @@ jobs:
           # 2. Add Host to known_hosts
           ssh-keyscan -p "$EC2_PORT" -H "$EC2_HOST" >> ~/.ssh/known_hosts 2>/dev/null
 
-          # 3. Pull/Clone Repository & Composer Install on EC2
-          ssh -i ~/.ssh/deploy_key -p "$EC2_PORT" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 "$EC2_USER@$EC2_HOST" "GITHUB_TOKEN='$GITHUB_TOKEN' REPOSITORY='$REPOSITORY' DB_HOST='$DB_HOST' DB_DATABASE='$DB_DATABASE' DB_USERNAME='$DB_USERNAME' DB_PASSWORD='$DB_PASSWORD' bash -se" << 'EOF'
+          # 3. Execute Docker deployment on EC2
+          ssh -i ~/.ssh/deploy_key -p "$EC2_PORT" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 "$EC2_USER@$EC2_HOST" \
+            "ECR_REGISTRY='$ECR_REGISTRY' IMAGE_TAG='$IMAGE_TAG' ECR_TOKEN='$ECR_TOKEN' bash -se" << 'EOF'
             set -ex
 
-            TARGET_DIR="/var/www/html/New_Laravel_Project"
-            REPO_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${REPOSITORY}.git"
+            IMAGE_NAME="$ECR_REGISTRY/laravelprojimage:latest"
+            CONTAINER_NAME="laravel_app"
+            ENV_FILE="/var/www/html/New_Laravel_Project/.env"
 
-            echo "🚀 Starting deployment to $TARGET_DIR..."
+            echo "🐳 Starting Docker deployment on EC2..."
 
-            # Directory and Repository Clone/Pull
-            if [ ! -d "$TARGET_DIR/.git" ]; then
-              echo "📂 Target directory does not contain git repository. Cloning repository..."
-              sudo mkdir -p "$TARGET_DIR" 2>/dev/null || mkdir -p "$TARGET_DIR"
-              sudo chown -R $USER:$USER "$TARGET_DIR" 2>/dev/null || true
-              git clone "$REPO_URL" "$TARGET_DIR"
-              cd "$TARGET_DIR"
-            else
-              echo "🔄 Repository exists. Pulling latest code..."
-              cd "$TARGET_DIR"
-              git remote set-url origin "$REPO_URL"
-              git fetch origin main
-              git reset --hard origin/main
-            fi
-
-            # Clean remote URL so token is not retained in git config
-            git remote set-url origin "https://github.com/${REPOSITORY}.git"
-
-            # Check and configure .env
-            if [ ! -f .env ]; then
-              echo "⚙️ .env file not found. Creating from .env.example..."
-              cp .env.example .env
-              php artisan key:generate --force
-            fi
-
-            # Update RDS database credentials if provided via GitHub Secrets
-            if [ -n "$DB_HOST" ]; then
-              echo "⚙️ Updating Database credentials from GitHub Secrets..."
-              grep -q "^DB_CONNECTION=" .env && sed -i "s|^DB_CONNECTION=.*|DB_CONNECTION=mysql|" .env || echo "DB_CONNECTION=mysql" >> .env
-              grep -q "^DB_HOST=" .env && sed -i "s|^DB_HOST=.*|DB_HOST=$DB_HOST|" .env || echo "DB_HOST=$DB_HOST" >> .env
-              grep -q "^DB_PORT=" .env && sed -i "s|^DB_PORT=.*|DB_PORT=3306|" .env || echo "DB_PORT=3306" >> .env
-              [ -n "$DB_DATABASE" ] && (grep -q "^DB_DATABASE=" .env && sed -i "s|^DB_DATABASE=.*|DB_DATABASE=$DB_DATABASE|" .env || echo "DB_DATABASE=$DB_DATABASE" >> .env)
-              [ -n "$DB_USERNAME" ] && (grep -q "^DB_USERNAME=" .env && sed -i "s|^DB_USERNAME=.*|DB_USERNAME=$DB_USERNAME|" .env || echo "DB_USERNAME=$DB_USERNAME" >> .env)
-              [ -n "$DB_PASSWORD" ] && (grep -q "^DB_PASSWORD=" .env && sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=$DB_PASSWORD|" .env || echo "DB_PASSWORD=$DB_PASSWORD" >> .env)
-            fi
-
-            # Setup AWS RDS CA Certificate for secure SSL/TLS connection
-            mkdir -p "$TARGET_DIR/storage/certs"
-            if [ ! -f "$TARGET_DIR/storage/certs/rds-ca-bundle.pem" ]; then
-              echo "🔒 Downloading AWS RDS CA Certificate Bundle..."
-              curl -sS https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem -o "$TARGET_DIR/storage/certs/rds-ca-bundle.pem"
-            fi
-
-            grep -q "^MYSQL_ATTR_SSL_CA=" .env && sed -i "s|^MYSQL_ATTR_SSL_CA=.*|MYSQL_ATTR_SSL_CA=$TARGET_DIR/storage/certs/rds-ca-bundle.pem|" .env || echo "MYSQL_ATTR_SSL_CA=$TARGET_DIR/storage/certs/rds-ca-bundle.pem" >> .env
-            grep -q "^MYSQL_ATTR_SSL_VERIFY_SERVER_CERT=" .env && sed -i "s|^MYSQL_ATTR_SSL_VERIFY_SERVER_CERT=.*|MYSQL_ATTR_SSL_VERIFY_SERVER_CERT=false|" .env || echo "MYSQL_ATTR_SSL_VERIFY_SERVER_CERT=false" >> .env
-
-            # Install/Update Composer Dependencies (Production)
-            echo "📦 Installing Composer dependencies..."
-            composer install --no-dev --prefer-dist --optimize-autoloader --no-interaction
-          EOF
-
-          # 4. Transfer Compiled Frontend Assets (Built in GitHub Actions with Node 22)
-          echo "🎨 Syncing compiled Vite assets to EC2..."
-          tar -czf - -C public build | ssh -i ~/.ssh/deploy_key -p "$EC2_PORT" -o StrictHostKeyChecking=accept-new "$EC2_USER@$EC2_HOST" "mkdir -p /var/www/html/New_Laravel_Project/public && tar -xzf - -C /var/www/html/New_Laravel_Project/public"
-
-          # 5. Run Migrations, Cache & Reload Web Services on EC2
-          ssh -i ~/.ssh/deploy_key -p "$EC2_PORT" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 "$EC2_USER@$EC2_HOST" "bash -se" << 'EOF'
-            set -ex
-
-            TARGET_DIR="/var/www/html/New_Laravel_Project"
-            cd "$TARGET_DIR"
-
-            # Clear cached config so fresh .env is loaded
-            php artisan config:clear
-            php artisan route:clear
-            php artisan view:clear
-
-            # Run Database Migrations
-            echo "🗄️ Running database migrations..."
-            php artisan migrate --force
-
-            # Optimize Laravel Cache
-            echo "⚡ Optimizing application caches..."
-            php artisan config:cache
-            php artisan route:cache
-            php artisan view:cache
-            php artisan event:cache
-
-            # Set Directory Permissions
-            echo "🔒 Setting directory permissions..."
-            WEB_USER="www-data"
-            if ! id -u www-data >/dev/null 2>&1; then
-              if id -u nginx >/dev/null 2>&1; then
-                WEB_USER="nginx"
-              elif id -u apache >/dev/null 2>&1; then
-                WEB_USER="apache"
-              else
-                WEB_USER="$USER"
-              fi
-            fi
-
-            sudo chown -R $USER:$WEB_USER "$TARGET_DIR" 2>/dev/null || chown -R $USER "$TARGET_DIR" 2>/dev/null || true
-            sudo chmod -R 775 "$TARGET_DIR/storage" "$TARGET_DIR/bootstrap/cache" "$TARGET_DIR/public/build" 2>/dev/null || chmod -R 775 "$TARGET_DIR/storage" "$TARGET_DIR/bootstrap/cache" "$TARGET_DIR/public/build" 2>/dev/null || true
-
-            # Reload Web Services
-            echo "🔄 Reloading services..."
-            if sudo systemctl is-active --quiet php8.2-fpm 2>/dev/null; then
-              sudo systemctl reload php8.2-fpm 2>/dev/null || true
-            elif sudo systemctl is-active --quiet php-fpm 2>/dev/null; then
-              sudo systemctl reload php-fpm 2>/dev/null || true
-            fi
-
+            # 1. Free Port 80 by disabling host web server if active
             if sudo systemctl is-active --quiet nginx 2>/dev/null; then
-              sudo systemctl reload nginx 2>/dev/null || true
-            elif sudo systemctl is-active --quiet apache2 2>/dev/null; then
-              sudo systemctl reload apache2 2>/dev/null || true
-            elif sudo systemctl is-active --quiet httpd 2>/dev/null; then
-              sudo systemctl reload httpd 2>/dev/null || true
+              echo "🛑 Stopping host Nginx to free Port 80 for Docker..."
+              sudo systemctl stop nginx || true
+              sudo systemctl disable nginx || true
+            fi
+            if sudo systemctl is-active --quiet apache2 2>/dev/null; then
+              sudo systemctl stop apache2 || true
+              sudo systemctl disable apache2 || true
             fi
 
-            echo "✅ Deployment completed successfully!"
+            # 2. Authenticate Docker with Amazon ECR
+            echo "🔑 Logging in to Amazon ECR..."
+            echo "$ECR_TOKEN" | sudo docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+            # 3. Pull latest image from ECR
+            echo "📥 Pulling latest image: $IMAGE_NAME..."
+            sudo docker pull "$IMAGE_NAME"
+
+            # 4. Run database migrations inside container
+            if [ -f "$ENV_FILE" ]; then
+              echo "🗄️ Running migrations inside Docker container..."
+              sudo docker run --rm --env-file "$ENV_FILE" "$IMAGE_NAME" php artisan migrate --force
+            else
+              echo "⚠️ Notice: $ENV_FILE not found, skipping migration step."
+            fi
+
+            # 5. Stop and remove existing container
+            if sudo docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+              echo "🛑 Replacing existing container..."
+              sudo docker stop "$CONTAINER_NAME" || true
+              sudo docker rm "$CONTAINER_NAME" || true
+            fi
+
+            # 6. Ensure log directory exists on host for persistent logs
+            sudo mkdir -p /var/www/html/New_Laravel_Project/storage/logs 2>/dev/null || true
+            sudo chmod -R 777 /var/www/html/New_Laravel_Project/storage/logs 2>/dev/null || true
+
+            # 7. Start the container
+            echo "🚀 Launching new container: $CONTAINER_NAME on Port 80..."
+            if [ -f "$ENV_FILE" ]; then
+              sudo docker run -d \
+                --name "$CONTAINER_NAME" \
+                --restart unless-stopped \
+                -p 80:80 \
+                --env-file "$ENV_FILE" \
+                -v /var/www/html/New_Laravel_Project/storage/logs:/var/www/html/storage/logs \
+                "$IMAGE_NAME"
+            else
+              sudo docker run -d \
+                --name "$CONTAINER_NAME" \
+                --restart unless-stopped \
+                -p 80:80 \
+                -v /var/www/html/New_Laravel_Project/storage/logs:/var/www/html/storage/logs \
+                "$IMAGE_NAME"
+            fi
+
+            # 8. Clean old dangling images
+            echo "🧹 Removing old unused Docker images..."
+            sudo docker image prune -f || true
+
+            echo "✅ Docker application is successfully running!"
+            sudo docker ps --filter "name=$CONTAINER_NAME"
           EOF
